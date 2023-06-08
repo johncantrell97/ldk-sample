@@ -1,3 +1,4 @@
+use crate::SampleLiquidityManager;
 use crate::disk;
 use crate::hex_utils;
 use crate::{
@@ -8,7 +9,8 @@ use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
 use bitcoin::network::constants::Network;
 use bitcoin::secp256k1::PublicKey;
-use lightning::chain::keysinterface::{EntropySource, KeysManager};
+use ldk_lsp_client::LiquidityManager;
+use lightning::sign::{EntropySource, KeysManager};
 use lightning::ln::channelmanager::{PaymentId, RecipientOnionFields, Retry};
 use lightning::ln::msgs::NetAddress;
 use lightning::ln::{PaymentHash, PaymentPreimage};
@@ -63,7 +65,7 @@ pub(crate) async fn poll_for_user_input(
 	keys_manager: Arc<KeysManager>, network_graph: Arc<NetworkGraph>,
 	onion_messenger: Arc<OnionMessenger>, inbound_payments: PaymentInfoStorage,
 	outbound_payments: PaymentInfoStorage, ldk_data_dir: String, network: Network,
-	logger: Arc<disk::FilesystemLogger>,
+	logger: Arc<disk::FilesystemLogger>, liquidity_manager: Arc<SampleLiquidityManager>,
 ) {
 	println!(
 		"LDK startup successful. Enter \"help\" to view available commands. Press Ctrl-D to quit."
@@ -87,6 +89,45 @@ pub(crate) async fn poll_for_user_input(
 		if let Some(word) = words.next() {
 			match word {
 				"help" => help(),
+				"getjitchannelinvoice" => {
+					let peer_pubkey_and_ip_addr = words.next();
+
+					if peer_pubkey_and_ip_addr.is_none() {
+						println!("ERROR: getjitchannelinvoice has 1 required argument: `getjitchannelinvoice pubkey@host:port [payment_amount_msat]`");
+						continue;
+					}
+					let peer_pubkey_and_ip_addr = peer_pubkey_and_ip_addr.unwrap();
+					let (pubkey, peer_addr) =
+						match parse_peer_info(peer_pubkey_and_ip_addr.to_string()) {
+							Ok(info) => info,
+							Err(e) => {
+								println!("{:?}", e.into_inner().unwrap());
+								continue;
+							}
+						};
+
+					if connect_peer_if_necessary(pubkey, peer_addr, peer_manager.clone())
+						.await
+						.is_err()
+					{
+						continue;
+					};
+
+					let mut payment_amount_msat = None;
+
+					if let Some(n) = words.next() {
+						let n: Result<u64, _> = n.parse();
+						if n.is_err() {
+							println!("ERROR: payment_amount_msat must be a number");
+							continue;
+						}
+						payment_amount_msat = Some(n.unwrap());
+					}
+
+					if let Err(e) = liquidity_manager.create_invoice(pubkey, payment_amount_msat, None, 0) {
+						println!("{:?}", e);
+					}
+				}
 				"openchannel" => {
 					let peer_pubkey_and_ip_addr = words.next();
 					let channel_value_sat = words.next();

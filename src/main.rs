@@ -10,26 +10,30 @@ use crate::bitcoind_client::BitcoindClient;
 use crate::disk::FilesystemLogger;
 use bitcoin::blockdata::transaction::Transaction;
 use bitcoin::consensus::encode;
+use bitcoin::hashes::{sha256, Hash};
 use bitcoin::network::constants::Network;
 use bitcoin::BlockHash;
+use bitcoin::secp256k1::Secp256k1;
 use bitcoin_bech32::WitnessProgram;
-use lightning::chain;
-use lightning::chain::keysinterface::{
+use lightning_invoice::{InvoiceBuilder, Currency, Sha256};
+use lightning::{chain, log_error};
+use lightning::sign::{
 	EntropySource, InMemorySigner, KeysManager, SpendableOutputDescriptor,
 };
+use lightning::routing::scoring::ProbabilisticScoringFeeParameters;
 use lightning::chain::{chainmonitor, ChannelMonitorUpdateStatus};
 use lightning::chain::{Filter, Watch};
 use lightning::events::{Event, PaymentFailureReason, PaymentPurpose};
-use lightning::ln::channelmanager;
+use lightning::ln::channelmanager::{self, MIN_FINAL_CLTV_EXPIRY_DELTA};
 use lightning::ln::channelmanager::{
 	ChainParameters, ChannelManagerReadArgs, SimpleArcChannelManager,
 };
-use lightning::ln::peer_handler::{IgnoringMessageHandler, MessageHandler, SimpleArcPeerManager};
+use lightning::ln::peer_handler::{IgnoringMessageHandler, MessageHandler, PeerManager as LDKPeerManager, APeerManager};
 use lightning::ln::{PaymentHash, PaymentPreimage, PaymentSecret};
 use lightning::onion_message::SimpleArcOnionMessenger;
-use lightning::routing::gossip;
+use lightning::routing::gossip::{self, RoutingFees};
 use lightning::routing::gossip::{NodeId, P2PGossipSync};
-use lightning::routing::router::DefaultRouter;
+use lightning::routing::router::{DefaultRouter, RouteHintHop, RouteHint};
 use lightning::util::config::UserConfig;
 use lightning::util::persist::KVStorePersister;
 use lightning::util::ser::ReadableArgs;
@@ -53,6 +57,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
+
+use ldk_lsp_client::{LiquidityManager, LiquidityProviderConfig, RawOpeningFeeParams, JITChannelEvent, JITChannelsConfig};
+use ldk_lsp_client::events::Event as LSPEvent;
 
 pub(crate) const PENDING_SPENDABLE_OUTPUT_DIR: &'static str = "pending_spendable_outputs";
 
@@ -91,7 +98,11 @@ type ChainMonitor = chainmonitor::ChainMonitor<
 	Arc<FilesystemPersister>,
 >;
 
-pub(crate) type PeerManager = SimpleArcPeerManager<
+pub(crate) type SimpleArcLiquidityManager<SD,M, T, F, C, L> = LiquidityManager<Arc<KeysManager>, SD, Arc<L>, Arc<P2PGossipSync<Arc<gossip::NetworkGraph<Arc<L>>>, Arc<C>, Arc<L>>>,Arc<SimpleArcChannelManager<M, T, F, L>>,Arc<SimpleArcOnionMessenger<L>>,Arc<KeysManager>>;
+
+pub(crate) type SimpleArcPeerManagerWithCustomMessageHandler<SD, M, T, F, C, L> = LDKPeerManager<SD, Arc<SimpleArcChannelManager<M, T, F, L>>, Arc<P2PGossipSync<Arc<gossip::NetworkGraph<Arc<L>>>, Arc<C>, Arc<L>>>, Arc<SimpleArcOnionMessenger<L>>, Arc<L>, Arc<SimpleArcLiquidityManager<SD,M,T,F,C,L>>, Arc<KeysManager>>;
+
+pub(crate) type PeerManager = SimpleArcPeerManagerWithCustomMessageHandler<
 	SocketDescriptor,
 	ChainMonitor,
 	BitcoindClient,
@@ -100,6 +111,8 @@ pub(crate) type PeerManager = SimpleArcPeerManager<
 	FilesystemLogger,
 >;
 
+pub(crate) type SampleLiquidityManager = SimpleArcLiquidityManager<SocketDescriptor, ChainMonitor, BitcoindClient, BitcoindClient, BitcoindClient, FilesystemLogger>;
+
 pub(crate) type ChannelManager =
 	SimpleArcChannelManager<ChainMonitor, BitcoindClient, BitcoindClient, FilesystemLogger>;
 
@@ -107,11 +120,172 @@ pub(crate) type NetworkGraph = gossip::NetworkGraph<Arc<FilesystemLogger>>;
 
 type OnionMessenger = SimpleArcOnionMessenger<FilesystemLogger>;
 
+async fn handle_lsp_event(
+	network: Network,
+	event: LSPEvent, 
+	channel_manager: &Arc<ChannelManager>,
+	keys_manager: &Arc<KeysManager>,
+	liquidity_manager: &Arc<SampleLiquidityManager>,
+) {
+	match event {
+		LSPEvent::LSPS2(event) => {
+			match event {
+				JITChannelEvent::GetInfo { 
+					request_id,
+					counterparty_node_id,
+					version,
+					token 
+				} => {
+					// determine based on counterparty_node_id + token
+					// what fees and restrictions you want to offer
+					let opening_fee_params_menu = vec![
+						RawOpeningFeeParams { 
+							min_fee_msat: 0, 
+							proportional: 0, 
+							valid_until: "2023-06-23T08:47:30.511Z".to_string(), 
+							min_lifetime: 1008, 
+							max_client_to_self_delay: 2016, 
+						}
+					];
+
+					// maybe these should be derived from the fees?
+					// if not, we will need to somehow store them such that we can
+					// be sure the payment_size_msat provided in buy request is within
+					// these bounds
+					//
+					// comment open on PR
+					let min_payment_size_msat = 1_000_000;
+					let max_payment_size_msat = 100_000_000_000;
+
+					if let Err(e) = liquidity_manager.opening_fee_params_generated(
+						counterparty_node_id, 
+						request_id, 
+						opening_fee_params_menu, 
+						min_payment_size_msat, 
+						max_payment_size_msat) {
+							println!("Failed to handle generated opening fee params: {:?}", e);
+						}
+				},
+				JITChannelEvent::GetInfoResponse { 
+					channel_id,
+					counterparty_node_id,
+					opening_fee_params_menu,
+					min_payment_size_msat,
+					max_payment_size_msat,
+					user_channel_id,
+				 } => {
+					// determine which fee params you want to use
+					// here we just take the first one
+					if let Err(e) = liquidity_manager.opening_fee_params_selected(
+						counterparty_node_id, 
+						channel_id, 
+						opening_fee_params_menu[0].clone()
+					) {
+						println!("Failed to select opening fee parameters: {:?}", e);
+					}
+				},
+				JITChannelEvent::BuyRequest { 
+					request_id,
+					counterparty_node_id,
+					version,
+					opening_fee_params,
+					payment_size_msat,
+				 } => {
+
+					// use channel manager to get an scid?
+					let scid = channel_manager.get_intercept_scid();
+					// pick a cltv_expiry_delta?
+					let cltv_expiry_delta = 144;
+
+					let client_trusts_lsp = false;
+
+					if let Err(e) = liquidity_manager.invoice_parameters_generated(
+						counterparty_node_id, 
+						request_id, 
+						scid, 
+						cltv_expiry_delta,
+						client_trusts_lsp
+					) {
+						println!("Failed to provide invoice parameters: {:?}", e);
+					}
+				 },
+				JITChannelEvent::InvoiceGenerationReady { 
+					counterparty_node_id,
+					scid,
+					cltv_expiry_delta ,
+					payment_size_msat,
+					..
+				} => {
+
+					// how long until we consider a payment invalid
+					// really we don't care? but probably should be based on the valid_until params we agreed upon with lsp
+					let invoice_expiry_delta_secs = 60*60*24*3;
+					let (payment_hash, payment_secret) = channel_manager.create_inbound_payment(None, invoice_expiry_delta_secs, None).unwrap();
+
+					let lsp_route_hint = RouteHint(vec![RouteHintHop {
+						src_node_id: counterparty_node_id,
+						short_channel_id: scid,
+						fees: RoutingFees { base_msat: 0, proportional_millionths: 0},
+						cltv_expiry_delta: cltv_expiry_delta.try_into().unwrap(),
+						htlc_minimum_msat: None,
+						htlc_maximum_msat: None
+					}]);
+
+					let mut invoice = InvoiceBuilder::new(network.into())
+						.description("Coins pls!".into())
+						.payment_hash(sha256::Hash::from_slice(&payment_hash.0).unwrap())
+						.payment_secret(payment_secret)
+						.current_timestamp()
+						.min_final_cltv_expiry_delta(MIN_FINAL_CLTV_EXPIRY_DELTA.into())
+						.private_route(lsp_route_hint);
+
+					if let Some(payment_size_msat) = payment_size_msat {
+						invoice = invoice.amount_milli_satoshis(payment_size_msat)
+					};
+
+					let invoice = invoice.build_signed(|hash| {
+							Secp256k1::new().sign_ecdsa_recoverable(hash, &keys_manager.get_node_secret_key())
+						})
+						.unwrap();
+
+					println!("JIT Channel Invoice: {}", invoice);
+
+				},
+				JITChannelEvent::FailInterceptedHTLC {
+					intercept_id
+				} => {
+					channel_manager.fail_intercepted_htlc(intercept_id);
+				},
+				JITChannelEvent::ForwardInterceptedHTLC {
+					intercept_id,
+					next_hop_channel_id,
+					next_node_id,
+					amt_to_forward_msat,
+				} => {
+					println!("forwarding intercepted htlc");
+
+					if let Err(e) = channel_manager.forward_intercepted_htlc(intercept_id, &next_hop_channel_id, next_node_id, amt_to_forward_msat) {
+						println!("failed to forward intercepted htlc: {:?}", e);
+					}
+				},
+				JITChannelEvent::OpenChannel {
+					user_channel_id,
+					their_network_key,
+					channel_value_satoshis,
+				} => {
+					channel_manager.create_channel(their_network_key, channel_value_satoshis, 0, user_channel_id, None);
+				}
+			}
+		}
+	}
+}
+
 async fn handle_ldk_events(
 	channel_manager: &Arc<ChannelManager>, bitcoind_client: &BitcoindClient,
 	network_graph: &NetworkGraph, keys_manager: &KeysManager,
 	inbound_payments: &PaymentInfoStorage, outbound_payments: &PaymentInfoStorage,
 	persister: &Arc<FilesystemPersister>, network: Network, event: Event,
+	liquidity_manager: &Arc<SampleLiquidityManager>,
 ) {
 	match event {
 		Event::FundingGenerationReady {
@@ -240,8 +414,16 @@ async fn handle_ldk_events(
 				}
 			}
 		}
-		Event::OpenChannelRequest { .. } => {
-			// Unreachable, we don't set manually_accept_inbound_channels
+		Event::OpenChannelRequest { 
+			temporary_channel_id, 
+			counterparty_node_id, 
+			.. 
+		} => {
+			// if counterparty_node_id is our LSP then:
+			if let Err(e) = channel_manager.accept_inbound_channel_from_trusted_peer_0conf(&temporary_channel_id, &counterparty_node_id, 0) {
+				println!("Failed to accept inbound channel: {:?}", e);
+			}
+			// else accept_inbound_channel
 		}
 		Event::PaymentPathSuccessful { .. } => {}
 		Event::PaymentPathFailed { .. } => {}
@@ -364,10 +546,12 @@ async fn handle_ldk_events(
 		}
 		Event::ChannelReady {
 			ref channel_id,
-			user_channel_id: _,
+			user_channel_id,
 			ref counterparty_node_id,
 			channel_type: _,
 		} => {
+			liquidity_manager.channel_ready(user_channel_id, channel_id, counterparty_node_id);
+
 			println!(
 				"\nEVENT: Channel {} with peer {} is ready to be used!",
 				hex_utils::hex_str(channel_id),
@@ -389,7 +573,9 @@ async fn handle_ldk_events(
 			// A "real" node should probably "lock" the UTXOs spent in funding transactions until
 			// the funding transaction either confirms, or this event is generated.
 		}
-		Event::HTLCIntercepted { .. } => {}
+		Event::HTLCIntercepted { requested_next_hop_scid, intercept_id, payment_hash, inbound_amount_msat, expected_outbound_amount_msat } => {
+			liquidity_manager.htlc_intercepted(requested_next_hop_scid, intercept_id, inbound_amount_msat, expected_outbound_amount_msat);
+		}
 	}
 }
 
@@ -519,11 +705,15 @@ async fn start_ldk() {
 		logger.clone(),
 		keys_manager.get_secure_random_bytes(),
 		scorer.clone(),
+		ProbabilisticScoringFeeParameters::default()
 	));
 
 	// Step 11: Initialize the ChannelManager
 	let mut user_config = UserConfig::default();
 	user_config.channel_handshake_limits.force_announced_channel_preference = false;
+	user_config.accept_intercept_htlcs = true;
+	user_config.manually_accept_inbound_channels = true;
+
 	let mut restarting_node = true;
 	let (channel_manager_blockhash, channel_manager) = {
 		if let Ok(mut f) = fs::File::open(format!("{}/manager", ldk_data_dir.clone())) {
@@ -633,19 +823,32 @@ async fn start_ldk() {
 	let mut ephemeral_bytes = [0; 32];
 	let current_time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
 	rand::thread_rng().fill_bytes(&mut ephemeral_bytes);
+
+	// this needs to be the same every time, probably should derive this from an existing secret (hash(node_secret?))
+	let promise_secret = keys_manager.get_secure_random_bytes();
+	let liquidity_provider_config = LiquidityProviderConfig {
+		jit_channels: Some(JITChannelsConfig {
+			promise_secret
+		})
+	};
+
+	let liquidity_manager = Arc::new(LiquidityManager::new(keys_manager.clone(), Some(liquidity_provider_config)));
+
 	let lightning_msg_handler = MessageHandler {
 		chan_handler: channel_manager.clone(),
 		route_handler: gossip_sync.clone(),
 		onion_message_handler: onion_messenger.clone(),
+		custom_message_handler: liquidity_manager.clone(),
 	};
 	let peer_manager: Arc<PeerManager> = Arc::new(PeerManager::new(
 		lightning_msg_handler,
 		current_time.try_into().unwrap(),
 		&ephemeral_bytes,
 		logger.clone(),
-		IgnoringMessageHandler {},
 		Arc::clone(&keys_manager),
 	));
+
+	liquidity_manager.set_peer_manager(peer_manager.clone());
 
 	// ## Running LDK
 	// Step 16: Initialize networking
@@ -701,6 +904,7 @@ async fn start_ldk() {
 	let inbound_payments_event_listener = Arc::clone(&inbound_payments);
 	let outbound_payments_event_listener = Arc::clone(&outbound_payments);
 	let persister_event_listener = Arc::clone(&persister);
+	let liquidity_manager_listener = Arc::clone(&liquidity_manager);
 	let network = args.network;
 	let event_handler = move |event: Event| {
 		let channel_manager_event_listener = Arc::clone(&channel_manager_event_listener);
@@ -710,6 +914,7 @@ async fn start_ldk() {
 		let inbound_payments_event_listener = Arc::clone(&inbound_payments_event_listener);
 		let outbound_payments_event_listener = Arc::clone(&outbound_payments_event_listener);
 		let persister_event_listener = Arc::clone(&persister_event_listener);
+		let liquidity_manager_listener = Arc::clone(&liquidity_manager_listener);
 		async move {
 			handle_ldk_events(
 				&channel_manager_event_listener,
@@ -721,6 +926,7 @@ async fn start_ldk() {
 				&persister_event_listener,
 				network,
 				event,
+				&liquidity_manager_listener
 			)
 			.await;
 		}
@@ -816,6 +1022,20 @@ async fn start_ldk() {
 		}
 	});
 
+	let liquidity_manager_events = liquidity_manager.clone();
+	let channel_manager_lsp_events = Arc::clone(&channel_manager);
+	let keys_manager_lsp_events = Arc::clone(&keys_manager);
+	tokio::spawn(async move {
+		let mut interval = tokio::time::interval(Duration::from_secs(1));
+		loop {
+			interval.tick().await;
+			let events = liquidity_manager_events.get_and_clear_pending_events();
+			for event in events {
+				handle_lsp_event(network, event, &channel_manager_lsp_events, &keys_manager_lsp_events, &liquidity_manager_events).await;
+			}
+		}
+	});
+
 	tokio::spawn(sweep::periodic_sweep(
 		ldk_data_dir.clone(),
 		Arc::clone(&keys_manager),
@@ -836,6 +1056,7 @@ async fn start_ldk() {
 		ldk_data_dir,
 		network,
 		Arc::clone(&logger),
+		Arc::clone(&liquidity_manager),
 	)
 	.await;
 
